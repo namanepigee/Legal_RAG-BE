@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import generics, status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
@@ -7,6 +9,8 @@ from django.db.models import Count
 from .models import ChatMessage, Document, DocumentChunk
 from rag.service import answer_question, extract_uploaded_file, index_document
 from .serializers import ChatMessageSerializer, DocumentChunkSerializer, DocumentSerializer, QuerySerializer
+
+logger = logging.getLogger(__name__)
 
 
 class HealthView(APIView):
@@ -53,7 +57,18 @@ class QueryView(APIView):
             return Response({"detail": "Document not found."}, status=status.HTTP_404_NOT_FOUND)
 
         ChatMessage.objects.create(document=document, role="user", content=question)
-        result = answer_question(question, document_id=document_id)
+        try:
+            result = answer_question(question, document_id=document_id)
+        except Exception:
+            logger.exception("Query failed for document_id=%s", document_id)
+            return Response(
+                {
+                    "detail": "Query failed on the backend. Check Render logs for the full error.",
+                    "answer": "The backend could not complete this query. Please check Render environment variables and logs.",
+                    "sources": [],
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         ChatMessage.objects.create(
             document=document,
             role="assistant",

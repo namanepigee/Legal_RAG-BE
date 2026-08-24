@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from math import sqrt
 from collections import Counter, OrderedDict
 from typing import TypedDict
@@ -12,6 +13,8 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 
 from api.models import Document, DocumentChunk
+
+logger = logging.getLogger(__name__)
 
 LEGAL_HEADING_RE = re.compile(
     r"^\s*("
@@ -403,26 +406,14 @@ def index_document(document: Document) -> None:
     )
     chunks = _legal_chunks(page_texts)
 
-    if not _ai_enabled():
-        DocumentChunk.objects.bulk_create(
-            [
-                DocumentChunk(
-                    document=document,
-                    content=chunk["content"],
-                    chapter_title=chunk["chapter_title"],
-                    section_number=chunk["section_number"],
-                    section_title=chunk["section_title"],
-                    subsection_number=chunk["subsection_number"],
-                    page_start=chunk["page_start"],
-                    page_end=chunk["page_end"],
-                    chunk_index=index,
-                )
-                for index, chunk in enumerate(chunks)
-            ]
-        )
-        return
+    vectors = []
+    if _ai_enabled() and chunks:
+        try:
+            vectors = _embeddings().embed_documents([chunk["content"] for chunk in chunks])
+        except Exception:
+            logger.exception("Embedding generation failed while indexing document %s", document.id)
+            vectors = []
 
-    vectors = _embeddings().embed_documents([chunk["content"] for chunk in chunks])
     DocumentChunk.objects.bulk_create(
         [
             DocumentChunk(
@@ -435,9 +426,9 @@ def index_document(document: Document) -> None:
                 page_start=chunk["page_start"],
                 page_end=chunk["page_end"],
                 chunk_index=index,
-                embedding=vector,
+                embedding=vectors[index] if index < len(vectors) else None,
             )
-            for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+            for index, chunk in enumerate(chunks)
         ]
     )
 
@@ -537,7 +528,12 @@ def _forced_chunks(question: str, candidates: list[DocumentChunk]) -> list[Docum
 
 
 def _rank_chunks(question: str, candidates: list[DocumentChunk]) -> list[tuple[DocumentChunk, float]]:
-    vector = _embeddings().embed_query(question) if _ai_enabled() else None
+    vector = None
+    if _ai_enabled():
+        try:
+            vector = _embeddings().embed_query(question)
+        except Exception:
+            logger.exception("Query embedding generation failed")
     ranked = []
     for chunk in candidates:
         score = _lexical_score(question, chunk)
@@ -650,8 +646,10 @@ def _generate_node(state: RagState) -> RagState:
         )
         for doc in state["context"]
     )
-    if not _ai_enabled():
-        answer = "Configure AI credentials to enable generated RAG answers. Retrieved context is returned below."
+    if not state["context"]:
+        answer = "I could not find indexed context for this document. Please re-upload the document or check that indexing completed successfully."
+    elif not _ai_enabled():
+        answer = "AI credentials are not configured on the backend. I retrieved relevant document context, but cannot generate an AI answer yet."
     else:
         prompt = (
             "You are answering a question about a legal document. Use only the retrieved context below. "
@@ -669,7 +667,16 @@ def _generate_node(state: RagState) -> RagState:
             "If the answer is not in the context, say exactly what is missing.\n\n"
             f"Context:\n{context}\n\nQuestion: {state['question']}"
         )
-        answer = _chat_model().invoke(prompt).content
+        try:
+            answer = _chat_model().invoke(prompt).content
+        except Exception:
+            logger.exception("Chat generation failed")
+            top = state["context"][0]
+            answer = (
+                "AI generation failed on the backend, but relevant document context was retrieved. "
+                f"The strongest source is {top.metadata.get('section_title') or 'Unknown section'} "
+                f"(page {_format_pages(top.metadata.get('page_start'), top.metadata.get('page_end'))})."
+            )
     return {**state, "answer": answer}
 
 
