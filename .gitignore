@@ -1,0 +1,46 @@
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Django local database
+db.sqlite3
+db.sqlite3-journal
+
+# Django generated/static files
+staticfiles/
+media/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Ruff / Mypy
+.ruff_cache/
+.mypy_cache/
