@@ -1,86 +1,91 @@
 import os
 import re
 import logging
+import hashlib
 from math import sqrt
 from collections import Counter, OrderedDict
+from dataclasses import dataclass
 from typing import TypedDict
 
 from langchain_core.documents import Document as LangChainDocument
 from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.graph import END, START, StateGraph
-from pypdf import PdfReader
-from docx import Document as DocxDocument
 
-from api.models import Document, DocumentChunk
+from api.models import Document
+
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client import models as qdrant_models
+except ImportError:
+    QdrantClient = None
+    qdrant_models = None
 
 logger = logging.getLogger(__name__)
 
-LEGAL_HEADING_RE = re.compile(
-    r"^\s*("
-    r"(?:chapter|part|article|section|sec\.?|rule|regulation|schedule|act)\s+"
-    r"[A-Za-z0-9IVXLCDM.\-()]+(?:\s*[:.-]\s*|\s+).*"
-    r"|[0-9]{1,3}[A-Z]?\.\s+.+"
-    r")$",
-    re.IGNORECASE,
-)
 MAX_CHUNK_WORDS = 450
 CHUNK_OVERLAP_WORDS = 70
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 PAGE_MARKER_RE = re.compile(r"^--- PAGE (\d+) ---$")
-INLINE_SECTION_BREAK_RE = re.compile(
-    r"(?<![\w*])(\d{1,3}[A-Z]?\.\s+[A-Z][A-Za-z ,()/'-]{2,}?\s*\.?\s*[—-]+)",
-)
-SECTION_TITLE_RE = re.compile(
-    r"^\s*(\d{1,3}[A-Z]?\.\s+.+?)(?:\s*\.?\s*[—-]+|\s+\(\d+\)|$)"
-)
-SECTION_NUMBER_RE = re.compile(r"^\s*(\d{1,3}[A-Z]?)\.\s+")
-SUBSECTION_RE = re.compile(r"\((\d+[A-Z]?|[a-z])\)")
-CHAPTER_RE = re.compile(r"^\s*CHAPTER\s+[IVXLCDM]+\b.*$", re.IGNORECASE)
-SCHEDULE_RE = re.compile(r"^\s*THE SCHEDULE\b.*$", re.IGNORECASE)
-
-INTENT_SECTION_HINTS = {
-    "definitions": {
-        "triggers": ("define", "definition", "meaning", "difference between", "who is"),
-        "sections": ("2",),
-        "headings": ("definition",),
-    },
-    "application": {
-        "triggers": ("apply", "applies", "application", "scope", "foreign", "outside india", "territorial", "excluded"),
-        "sections": ("3", "17"),
-        "headings": ("application", "scope", "exemption"),
-    },
-    "consent": {
-        "triggers": ("consent", "valid consent", "withdraw", "accept", "necessary personal data", "affirmative"),
-        "sections": ("5", "6", "7"),
-        "headings": ("notice", "consent", "legitimate"),
-    },
-    "rights": {
-        "triggers": ("rights", "access", "correction", "updating", "erasure", "grievance", "nomination"),
-        "sections": ("11", "12", "13", "14"),
-        "headings": ("access", "correction", "erasure", "grievance", "nomination"),
-    },
-    "obligations": {
-        "triggers": ("obligation", "responsible", "processor", "fiduciary", "safeguard", "breach"),
-        "sections": ("8", "9", "10"),
-        "headings": ("obligation", "fiduciary", "children", "significant"),
-    },
-    "penalties": {
-        "triggers": ("penalty", "penalties", "automatic", "fine", "schedule", "maximum", "impose", "factors"),
-        "sections": ("33",),
-        "headings": ("penalty", "schedule"),
-    },
-}
-
 
 class RagState(TypedDict):
     question: str
     document_id: int | None
+    history: list[dict]
     context: list[LangChainDocument]
     answer: str
+    validated_sources: list[LangChainDocument]
+
+from pydantic import BaseModel, Field
+
+class AnswerWithSources(BaseModel):
+    answer: str = Field(description="The complete grounded answer based on the context.")
+    used_sources: list[int] = Field(description="A list of chunk_id numbers representing the specific sources used to answer.")
+
+
+@dataclass
+class ChunkRecord:
+    id: int
+    document_id: int
+    document_title: str
+    content: str
+    chapter_title: str = ""
+    section_number: str = ""
+    section_title: str = ""
+    subsection_number: str = ""
+    page_start: int | None = None
+    page_end: int | None = None
+    chunk_index: int = 0
+    embedding: list[float] | None = None
+
+
+class LocalHashEmbeddings:
+    dimensions = 384
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_query(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        tokens = _tokens(text)
+        for token in tokens:
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:4], "big") % self.dimensions
+            sign = 1.0 if digest[4] % 2 == 0 else -1.0
+            vector[index] += sign
+
+        norm = sqrt(sum(value * value for value in vector))
+        if not norm:
+            return vector
+        return [value / norm for value in vector]
 
 
 def _embeddings():
+    if os.getenv("EMBEDDING_PROVIDER", "").lower() == "local":
+        return LocalHashEmbeddings()
+    if os.getenv("EMBEDDING_PROVIDER", "").lower() == "gemini":
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        return GoogleGenerativeAIEmbeddings(model=os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004"))
     if os.getenv("AI_PROVIDER", "").lower() == "bedrock":
         return BedrockEmbeddings(
             model_id=os.getenv("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0"),
@@ -90,43 +95,201 @@ def _embeddings():
 
 
 def _chat_model():
+    if os.getenv("AI_PROVIDER", "").lower() == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-pro"), temperature=0)
     if os.getenv("AI_PROVIDER", "").lower() == "bedrock":
         return ChatBedrockConverse(
             model=os.getenv("AI_MODEL", "anthropic.claude-3-5-haiku-20241022-v1:0"),
             region_name=os.getenv("AWS_REGION", "us-east-1"),
             temperature=0,
         )
+    if os.getenv("AI_PROVIDER", "").lower() == "openrouter":
+        return ChatOpenAI(
+            model=os.getenv("AI_MODEL", "google/gemini-2.0-pro-exp-02-05:free"), 
+            temperature=0, 
+            openai_api_key=os.getenv("OPENROUTER_API_KEY"), 
+            openai_api_base="https://openrouter.ai/api/v1"
+        )
     return ChatOpenAI(model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"), temperature=0)
 
 
 def _ai_enabled() -> bool:
     provider = os.getenv("AI_PROVIDER", "").lower()
+    if provider == "gemini":
+        return bool(os.getenv("GEMINI_API_KEY"))
     if provider == "bedrock":
         return bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
+    if provider == "openrouter":
+        return bool(os.getenv("OPENROUTER_API_KEY"))
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
+def _embeddings_enabled() -> bool:
+    if os.getenv("EMBEDDING_PROVIDER", "").lower() == "local":
+        return True
+    return _ai_enabled()
+
+
+def _vector_store() -> str:
+    return os.getenv("VECTOR_STORE", "qdrant").lower()
+
+
+def _qdrant_collection() -> str:
+    return os.getenv("QDRANT_COLLECTION", "legal_document_chunks")
+
+
+def _qdrant_client():
+    if _vector_store() != "qdrant" or QdrantClient is None:
+        return None
+
+    url = os.getenv("QDRANT_URL", "").strip()
+    if not url:
+        return None
+
+    return QdrantClient(
+        url=url,
+        api_key=os.getenv("QDRANT_API_KEY") or None,
+        timeout=30,
+    )
+
+
+def _ensure_qdrant_collection(client, vector_size: int) -> None:
+    collection = _qdrant_collection()
+    try:
+        client.get_collection(collection)
+        _ensure_qdrant_payload_indexes(client)
+        return
+    except Exception:
+        pass
+
+    client.create_collection(
+        collection_name=collection,
+        vectors_config=qdrant_models.VectorParams(
+            size=vector_size,
+            distance=qdrant_models.Distance.COSINE,
+        ),
+    )
+    _ensure_qdrant_payload_indexes(client)
+
+
+def _ensure_qdrant_payload_indexes(client) -> None:
+    try:
+        client.create_payload_index(
+            collection_name=_qdrant_collection(),
+            field_name="document_id",
+            field_schema=qdrant_models.PayloadSchemaType.INTEGER,
+        )
+    except Exception:
+        pass
+
+
+def _delete_qdrant_document_vectors(document_id: int) -> None:
+    client = _qdrant_client()
+    if client is None or qdrant_models is None:
+        return
+
+    try:
+        client.get_collection(_qdrant_collection())
+    except Exception:
+        return
+
+    try:
+        client.delete(
+            collection_name=_qdrant_collection(),
+            points_selector=qdrant_models.Filter(
+                must=[
+                    qdrant_models.FieldCondition(
+                        key="document_id",
+                        match=qdrant_models.MatchValue(value=document_id),
+                    )
+                ]
+            ),
+        )
+    except Exception:
+        logger.exception("Qdrant cleanup failed for document %s", document_id)
+
+
+def _upsert_qdrant_vectors(chunks: list[ChunkRecord], vectors: list[list[float]]) -> None:
+    client = _qdrant_client()
+    if client is None or qdrant_models is None or not chunks or not vectors:
+        return
+
+    try:
+        _ensure_qdrant_collection(client, len(vectors[0]))
+        points = []
+        for chunk, vector in zip(chunks, vectors):
+            points.append(
+                qdrant_models.PointStruct(
+                    id=chunk.id,
+                    vector=vector,
+                    payload={
+                        "chunk_id": chunk.id,
+                        "document_id": chunk.document_id,
+                        "chunk_index": chunk.chunk_index,
+                        "document_title": chunk.document_title,
+                        "chapter_title": chunk.chapter_title,
+                        "section_number": chunk.section_number,
+                        "section_title": chunk.section_title,
+                        "subsection_number": chunk.subsection_number,
+                        "page_start": chunk.page_start,
+                        "page_end": chunk.page_end,
+                        "content": chunk.content,
+                    },
+                )
+            )
+        client.upsert(collection_name=_qdrant_collection(), points=points)
+    except Exception:
+        logger.exception("Qdrant upsert failed for %s chunks", len(chunks))
+
+
+import tempfile
+from docling.document_converter import DocumentConverter
+
 def extract_uploaded_file(upload) -> dict:
     name = upload.name.lower()
-    if name.endswith(".pdf"):
-        reader = PdfReader(upload)
-        pages = [
-            {"page": index + 1, "text": page.extract_text() or ""}
-            for index, page in enumerate(reader.pages)
-        ]
-        return {
-            "content": "\n\n".join(f"--- PAGE {page['page']} ---\n{page['text']}" for page in pages),
-            "page_count": len(pages),
-            "pages": pages,
-        }
-
-    if name.endswith(".docx"):
-        doc = DocxDocument(upload)
-        text = "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip())
+    
+    if not (name.endswith(".pdf") or name.endswith(".docx")):
+        text = upload.read().decode("utf-8", errors="ignore")
         return {"content": text, "page_count": 0, "pages": [{"page": None, "text": text}]}
 
-    text = upload.read().decode("utf-8", errors="ignore")
-    return {"content": text, "page_count": 0, "pages": [{"page": None, "text": text}]}
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{name.split('.')[-1]}") as tmp:
+        for chunk in upload.chunks():
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        converter = DocumentConverter()
+        doc = converter.convert(tmp_path).document
+
+        page_dict = {}
+        for item, level in doc.iterate_items():
+            if hasattr(item, "text") and item.text:
+                page_no = None
+                if hasattr(item, "prov") and item.prov:
+                    page_no = item.prov[0].page_no
+
+                if page_no not in page_dict:
+                    page_dict[page_no] = []
+                page_dict[page_no].append(item.text)
+
+        pages = []
+        for page_no, texts in sorted(page_dict.items(), key=lambda x: x[0] if x[0] is not None else 0):
+            pages.append({"page": page_no, "text": "\n".join(texts)})
+
+        if not pages:
+            text = doc.export_to_markdown()
+            pages = [{"page": None, "text": text}]
+
+        content = "\n\n".join(f"--- PAGE {p['page']} ---\n{p['text']}" if p["page"] else p["text"] for p in pages)
+        page_count = len([p for p in pages if p["page"] is not None])
+        return {
+            "content": content,
+            "page_count": page_count,
+            "pages": pages,
+        }
+    finally:
+        os.unlink(tmp_path)
 
 
 def _word_windows(text: str, max_words: int = MAX_CHUNK_WORDS) -> list[str]:
@@ -147,45 +310,6 @@ def _word_windows(text: str, max_words: int = MAX_CHUNK_WORDS) -> list[str]:
 
 def _tokens(text: str) -> list[str]:
     return TOKEN_RE.findall(text.lower())
-
-
-def _normalize_legal_text(text: str) -> str:
-    text = text.replace("\u2013", "—").replace("\u2014", "—").replace(" -", " —")
-    text = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines())
-    text = INLINE_SECTION_BREAK_RE.sub(r"\n\1", text)
-    text = re.sub(r"\b(CHAPTER\s+[IVXLCDM]+)\b", r"\n\1\n", text, flags=re.IGNORECASE)
-    return text
-
-
-def _is_table_of_contents_page(text: str) -> bool:
-    upper = text.upper()
-    numbered_lines = len(re.findall(r"(?m)^\s*\d{1,3}[A-Z]?\.\s+[A-Z]", text))
-    return (
-        "ARRANGEMENT OF SECTIONS" in upper
-        or (
-            "SECTIONS" in upper
-            and "BE IT ENACTED" not in upper
-            and numbered_lines >= 4
-        )
-    )
-
-
-def _section_title(line: str, heading_match: re.Match) -> str:
-    numbered = SECTION_TITLE_RE.match(line)
-    if numbered:
-        return numbered.group(1).strip()[:500]
-    title = heading_match.group(1).strip()
-    return title[:500]
-
-
-def _section_number(title: str) -> str:
-    match = SECTION_NUMBER_RE.match(title or "")
-    return match.group(1) if match else ""
-
-
-def _subsection_number(text: str) -> str:
-    match = SUBSECTION_RE.search(text or "")
-    return match.group(1) if match else ""
 
 
 def _meaningful_query_tokens(question: str) -> set[str]:
@@ -209,65 +333,33 @@ def _meaningful_query_tokens(question: str) -> set[str]:
     return {token for token in _tokens(question) if token not in stopwords and len(token) > 2}
 
 
-def _section_title_match(question: str, chunk: DocumentChunk) -> bool:
-    query_tokens = _meaningful_query_tokens(question)
-    title_tokens = set(_tokens(chunk.section_title or ""))
-    if not query_tokens or not title_tokens:
-        return False
-    return query_tokens.issubset(title_tokens) or len(query_tokens & title_tokens) >= min(3, len(query_tokens))
+def _query_phrases(question: str) -> list[str]:
+    words = [token for token in _tokens(question) if len(token) > 2]
+    phrases = []
+    for size in (4, 3, 2):
+        for index in range(0, max(0, len(words) - size + 1)):
+            phrases.append(" ".join(words[index : index + size]))
+    return phrases
 
 
-def _query_intents(question: str) -> set[str]:
-    lower = question.lower()
-    intents = set()
-    for intent, config in INTENT_SECTION_HINTS.items():
-        if any(trigger in lower for trigger in config["triggers"]):
-            intents.add(intent)
-    return intents
-
-
-def _hint_score(question: str, chunk: DocumentChunk) -> float:
-    intents = _query_intents(question)
-    if not intents:
-        return 0.0
-    score = 0.0
-    title = (chunk.section_title or "").lower()
-    for intent in intents:
-        config = INTENT_SECTION_HINTS[intent]
-        if chunk.section_number in config["sections"]:
-            score += 4.0
-        if any(heading in title for heading in config["headings"]):
-            score += 2.0
-        if intent == "penalties" and (chunk.section_title or "").lower() == "schedule":
-            score += 4.0
-    return score
-
-
-def _lexical_score(question: str, chunk: DocumentChunk) -> float:
+def _lexical_score(question: str, chunk: ChunkRecord) -> float:
     query_tokens = _tokens(question)
     if not query_tokens:
         return 0.0
 
     query_counts = Counter(query_tokens)
-    title = chunk.section_title or ""
-    searchable = f"{title}\n{chunk.content}"
+    searchable = chunk.content
     searchable_tokens = Counter(_tokens(searchable))
     overlap = sum(min(count, searchable_tokens[token]) for token, count in query_counts.items())
     score = overlap / max(len(query_tokens), 1)
 
     question_lower = question.lower()
-    title_lower = title.lower()
     content_lower = chunk.content.lower()
-    if question_lower and question_lower in title_lower:
-        score += 3.0
     if question_lower and question_lower in content_lower[:500]:
         score += 1.5
-    if _section_title_match(question, chunk):
-        score += 5.0
-    score += _hint_score(question, chunk)
-    for phrase in ("short title", "commencement", "definitions", "applicability", "consent"):
-        if phrase in question_lower and phrase in searchable.lower():
-            score += 1.2
+    for phrase in _query_phrases(question):
+        if phrase in content_lower[:800]:
+            score += 0.8
     return score
 
 
@@ -280,71 +372,21 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _legal_chunks(page_texts: list[dict]) -> list[dict]:
-    sections = []
-    current_chapter = ""
-    current = {"title": "Document opening", "chapter": "", "parts": [], "pages": set()}
-    in_schedule = False
-
+def _page_chunks(page_texts: list[dict]) -> list[dict]:
+    chunks = []
     for page_item in page_texts:
         page_number = page_item.get("page")
-        page_text = page_item.get("text", "")
-        if _is_table_of_contents_page(page_text):
-            continue
-
-        for raw_line in _normalize_legal_text(page_text).splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            if SCHEDULE_RE.match(line):
-                if current["parts"]:
-                    sections.append(current)
-                in_schedule = True
-                current_chapter = "Schedule"
-                current = {"title": "Schedule", "chapter": "Schedule", "parts": [line], "pages": set()}
-                if page_number:
-                    current["pages"].add(page_number)
-                continue
-
-            if CHAPTER_RE.match(line):
-                in_schedule = False
-                current_chapter = line[:255]
-                current["parts"].append(line)
-                if page_number:
-                    current["pages"].add(page_number)
-                continue
-
-            heading = None if in_schedule else LEGAL_HEADING_RE.match(line)
-            if heading and current["parts"]:
-                sections.append(current)
-                current = {"title": _section_title(line, heading), "chapter": current_chapter, "parts": [line], "pages": set()}
-            else:
-                if heading:
-                    current["title"] = _section_title(line, heading)
-                    current["chapter"] = current_chapter
-                current["parts"].append(line)
-
-            if page_number:
-                current["pages"].add(page_number)
-
-    if current["parts"]:
-        sections.append(current)
-
-    chunks = []
-    for section in sections:
-        text = "\n".join(section["parts"])
-        pages = sorted(section["pages"])
+        text = re.sub(r"[ \t]+", " ", page_item.get("text", "")).strip()
         for chunk_text in _word_windows(text):
             chunks.append(
                 {
                     "content": chunk_text,
-                    "chapter_title": section["chapter"],
-                    "section_number": _section_number(section["title"]),
-                    "section_title": section["title"],
-                    "subsection_number": _subsection_number(chunk_text),
-                    "page_start": pages[0] if pages else None,
-                    "page_end": pages[-1] if pages else None,
+                    "chapter_title": "",
+                    "section_number": "",
+                    "section_title": "",
+                    "subsection_number": "",
+                    "page_start": page_number,
+                    "page_end": page_number,
                 }
             )
     return chunks
@@ -398,193 +440,187 @@ def _legacy_page_texts_from_document_content(content: str, page_count: int) -> l
 
 
 def index_document(document: Document) -> None:
-    DocumentChunk.objects.filter(document=document).delete()
+    _delete_qdrant_document_vectors(document.id)
     page_texts = getattr(
         document,
         "_page_texts",
         _legacy_page_texts_from_document_content(document.content, document.page_count),
     )
-    chunks = _legal_chunks(page_texts)
+    chunks = _page_chunks(page_texts)
 
     vectors = []
-    if _ai_enabled() and chunks:
+    if _embeddings_enabled() and chunks:
         try:
+            logger.info("Generating embeddings for %s chunks for document %s", len(chunks), document.id)
             vectors = _embeddings().embed_documents([chunk["content"] for chunk in chunks])
+            logger.info("Successfully generated embeddings for %s chunks", len(vectors))
         except Exception:
             logger.exception("Embedding generation failed while indexing document %s", document.id)
             vectors = []
 
-    DocumentChunk.objects.bulk_create(
-        [
-            DocumentChunk(
-                document=document,
-                content=chunk["content"],
-                chapter_title=chunk["chapter_title"],
-                section_number=chunk["section_number"],
-                section_title=chunk["section_title"],
-                subsection_number=chunk["subsection_number"],
-                page_start=chunk["page_start"],
-                page_end=chunk["page_end"],
-                chunk_index=index,
-                embedding=vectors[index] if index < len(vectors) else None,
-            )
-            for index, chunk in enumerate(chunks)
-        ]
-    )
+    point_base = document.id * 1_000_000
+    created_chunks = [
+        ChunkRecord(
+            id=point_base + index,
+            document_id=document.id,
+            document_title=document.title,
+            content=chunk["content"],
+            chapter_title=chunk["chapter_title"],
+            section_number=chunk["section_number"],
+            section_title=chunk["section_title"],
+            subsection_number=chunk["subsection_number"],
+            page_start=chunk["page_start"],
+            page_end=chunk["page_end"],
+            chunk_index=index,
+            embedding=vectors[index] if index < len(vectors) else None,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    _upsert_qdrant_vectors(created_chunks, vectors)
 
 
 def _decompose_query(question: str) -> list[str]:
-    lower = question.lower()
     subqueries = [question]
-    concept_map = {
-        "access": "Data Principal right to access information",
-        "correction": "Data Principal correction updating erasure",
-        "updating": "Data Principal correction updating erasure",
-        "erasure": "Data Principal correction updating erasure",
-        "grievance": "grievance redressal Data Principal",
-        "nomination": "nomination Data Principal",
-        "processor": "Data Processor definition and processing on behalf of Data Fiduciary",
-        "fiduciary": "Data Fiduciary definition and obligations",
-        "principal": "Data Principal definition",
-        "consent": "Section 6 Consent free specific informed unconditional unambiguous necessary specified purpose",
-        "foreign": "Section 3 Application outside India offering goods or services",
-        "outside india": "Section 3 Application outside India offering goods or services",
-        "penalt": "Section 33 monetary penalty Schedule factors automatic",
-        "automatic": "Section 33 monetary penalty factors not automatic",
-    }
-    for key, subquery in concept_map.items():
-        if key in lower and subquery not in subqueries:
-            subqueries.append(subquery)
-    if "difference between" in lower:
-        subqueries.extend([
-            "Section 2 definitions Data Principal Data Fiduciary Data Processor",
-            "Section 8 Data Fiduciary responsible processing on behalf Data Processor",
-        ])
+    tokens = list(_meaningful_query_tokens(question))
+    phrases = _query_phrases(question)
+    subqueries.extend(phrases[:6])
+    if len(tokens) > 6:
+        subqueries.append(" ".join(tokens[:6]))
     return subqueries[:8]
 
 
 def _fallback_queries(question: str) -> list[str]:
-    lower = question.lower()
     queries = _decompose_query(question)
-    if any(term in lower for term in ("definition", "define", "difference between", "meaning")):
-        queries.append("Section 2 Definitions Data Principal Data Fiduciary Data Processor")
-    if any(term in lower for term in ("apply", "foreign", "outside india", "scope")):
-        queries.append("Section 3 Application of Act outside India goods services Data Principals in India")
-    if "consent" in lower or "accept" in lower:
-        queries.append("Section 6 Consent free specific informed unconditional unambiguous clear affirmative action necessary specified purpose")
-    if any(term in lower for term in ("rights", "access", "correction", "erasure", "grievance", "nomination")):
-        queries.extend([
-            "Section 11 right to access information about personal data",
-            "Section 12 right to correction updating and erasure",
-            "Section 13 grievance redressal",
-            "Section 14 nomination",
-        ])
-    if "processor" in lower and "responsible" in lower:
-        queries.append("Section 8 Data Fiduciary responsible processing on behalf by Data Processor")
-    if "penalt" in lower or "automatic" in lower or "maximum" in lower:
-        queries.extend(["Section 33 monetary penalty factors inquiry", "Schedule monetary penalties"])
+    tokens = list(_meaningful_query_tokens(question))
+    for token in tokens[:8]:
+        queries.append(token)
     return list(OrderedDict.fromkeys(queries))
 
 
-def _forced_sections(question: str) -> list[str]:
-    lower = question.lower()
-    sections = []
-    if "short title" in lower or "commencement" in lower:
-        sections.extend(["1"])
-    if any(term in lower for term in ("definition", "define", "difference between", "meaning", "who is")):
-        sections.extend(["2"])
-    if "processor" in lower and ("responsible" in lower or "fiduciary" in lower):
-        sections.extend(["2", "8"])
-    if any(term in lower for term in ("foreign", "outside india", "apply", "applies", "application", "scope")):
-        sections.extend(["3"])
-        if "excluded" in lower or "exemption" in lower:
-            sections.append("17")
-    if "consent" in lower or "accept" in lower or "necessary personal data" in lower:
-        sections.extend(["6"])
-        if "notice" in lower:
-            sections.append("5")
-    if any(term in lower for term in ("rights", "access", "correction", "updating", "erasure", "grievance", "nomination")):
-        sections.extend(["11", "12", "13", "14"])
-    if any(term in lower for term in ("penalty", "penalties", "automatic", "maximum", "fine")):
-        sections.append("33")
-    return list(OrderedDict.fromkeys(sections))
+def _document_chunk_records(document: Document) -> list[ChunkRecord]:
+    chunks = _page_chunks(_legacy_page_texts_from_document_content(document.content, document.page_count))
+    point_base = document.id * 1_000_000
+    return [
+        ChunkRecord(
+            id=point_base + index,
+            document_id=document.id,
+            document_title=document.title,
+            content=chunk["content"],
+            chapter_title=chunk["chapter_title"],
+            section_number=chunk["section_number"],
+            section_title=chunk["section_title"],
+            subsection_number=chunk["subsection_number"],
+            page_start=chunk["page_start"],
+            page_end=chunk["page_end"],
+            chunk_index=index,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
 
 
-def _forced_chunks(question: str, candidates: list[DocumentChunk]) -> list[DocumentChunk]:
-    forced = []
-    for section in _forced_sections(question):
-        section_chunks = [chunk for chunk in candidates if chunk.section_number == section]
-        section_chunks = sorted(section_chunks, key=lambda chunk: (_lexical_score(question, chunk), -chunk.chunk_index), reverse=True)
-        forced.extend(section_chunks[:2])
+def _candidate_chunks(document_id: int | None = None) -> list[ChunkRecord]:
+    documents = Document.objects.all()
+    if document_id:
+        documents = documents.filter(id=document_id)
 
-    if any(term in question.lower() for term in ("penalty", "penalties", "maximum", "schedule")):
-        schedule_chunks = [
-            chunk
-            for chunk in candidates
-            if (chunk.chapter_title or "").lower() == "schedule" or (chunk.section_title or "").lower() == "schedule"
-        ]
-        forced.extend(sorted(schedule_chunks, key=lambda chunk: chunk.chunk_index)[:4])
-    return forced
+    candidates = []
+    for document in documents:
+        candidates.extend(_document_chunk_records(document))
+    return candidates
 
 
-def _rank_chunks(question: str, candidates: list[DocumentChunk]) -> list[tuple[DocumentChunk, float]]:
-    vector = None
-    if _ai_enabled():
-        try:
-            vector = _embeddings().embed_query(question)
-        except Exception:
-            logger.exception("Query embedding generation failed")
+def _chunk_from_qdrant_payload(point) -> ChunkRecord:
+    payload = point.payload or {}
+    return ChunkRecord(
+        id=int(payload.get("chunk_id") or point.id),
+        document_id=int(payload.get("document_id") or 0),
+        document_title=payload.get("document_title") or "",
+        content=payload.get("content") or "",
+        chapter_title=payload.get("chapter_title") or "",
+        section_number=payload.get("section_number") or "",
+        section_title=payload.get("section_title") or "",
+        subsection_number=payload.get("subsection_number") or "",
+        page_start=payload.get("page_start"),
+        page_end=payload.get("page_end"),
+        chunk_index=int(payload.get("chunk_index") or 0),
+    )
+
+
+def _rank_chunks(question: str, candidates: list[ChunkRecord]) -> list[tuple[ChunkRecord, float]]:
     ranked = []
     for chunk in candidates:
         score = _lexical_score(question, chunk)
-        if vector and chunk.embedding:
-            score += _cosine_similarity(vector, chunk.embedding)
         ranked.append((chunk, score))
     return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
-def _section_sort_key(section_number: str) -> tuple[int, str]:
-    match = re.match(r"(\d+)([A-Z]?)", section_number or "")
-    if not match:
-        return (9999, section_number or "")
-    return (int(match.group(1)), match.group(2))
+def _qdrant_ranked_chunks(question: str, document_id: int | None = None, limit: int = 24) -> list[ChunkRecord]:
+    client = _qdrant_client()
+    if client is None or qdrant_models is None or not _embeddings_enabled():
+        return []
+
+    try:
+        vector = _embeddings().embed_query(question)
+    except Exception:
+        logger.exception("Query embedding generation failed")
+        return []
+
+    query_filter = None
+    if document_id:
+        query_filter = qdrant_models.Filter(
+            must=[
+                qdrant_models.FieldCondition(
+                    key="document_id",
+                    match=qdrant_models.MatchValue(value=document_id),
+                )
+            ]
+        )
+
+    try:
+        results = client.search(
+            collection_name=_qdrant_collection(),
+            query_vector=vector,
+            query_filter=query_filter,
+            limit=limit,
+        )
+    except Exception:
+        _ensure_qdrant_payload_indexes(client)
+        try:
+            results = client.search(
+                collection_name=_qdrant_collection(),
+                query_vector=vector,
+                query_filter=query_filter,
+                limit=limit,
+            )
+        except Exception:
+            logger.exception("Qdrant vector search failed")
+            return []
+
+    return [_chunk_from_qdrant_payload(point) for point in results]
 
 
-def _expand_neighbours(chunks: list[DocumentChunk], all_chunks: list[DocumentChunk], question: str) -> list[DocumentChunk]:
-    lower = question.lower()
-    broad = any(term in lower for term in ("rights", "obligations", "process", "procedure", "powers", "appeals", "complete", "all"))
-    sections = {chunk.section_number for chunk in chunks if chunk.section_number}
-    intents = _query_intents(question)
-    wanted_sections = set()
+def _vector_ranked_chunks(question: str, candidates: list[ChunkRecord], document_id: int | None = None, limit: int = 24) -> list[ChunkRecord]:
+    qdrant_chunks = _qdrant_ranked_chunks(question, document_id, limit)
+    if qdrant_chunks:
+        return qdrant_chunks
 
-    for intent in intents:
-        wanted_sections.update(INTENT_SECTION_HINTS[intent]["sections"])
+    if not _embeddings_enabled():
+        return []
 
-    if broad:
-        for section in list(sections):
-            number, suffix = _section_sort_key(section)
-            if number != 9999 and not suffix:
-                wanted_sections.update(str(candidate) for candidate in range(max(1, number - 1), number + 3))
+    try:
+        vector = _embeddings().embed_query(question)
+    except Exception:
+        logger.exception("Query embedding generation failed")
+        return []
 
-    if "processor" in lower and "fiduciary" in lower:
-        wanted_sections.update({"2", "8"})
-    expanded = list(chunks)
-    if "penalt" in lower or "automatic" in lower:
-        wanted_sections.add("33")
-        for chunk in all_chunks:
-            if (
-                (chunk.chapter_title or "").lower() == "schedule"
-                or (chunk.section_title or "").lower() == "schedule"
-            ) and chunk not in expanded:
-                expanded.append(chunk)
-
-    for chunk in all_chunks:
-        if chunk.section_number in wanted_sections and chunk not in expanded:
-            expanded.append(chunk)
-    return expanded
+    scored = []
+    for chunk in candidates:
+        if chunk.embedding:
+            scored.append((chunk, _cosine_similarity(vector, chunk.embedding)))
+    return [chunk for chunk, _score in sorted(scored, key=lambda item: item[1], reverse=True)[:limit]]
 
 
-def _dedupe_chunks(chunks: list[DocumentChunk], limit: int) -> list[DocumentChunk]:
+def _dedupe_chunks(chunks: list[ChunkRecord], limit: int) -> list[ChunkRecord]:
     deduped = OrderedDict()
     for chunk in chunks:
         key = chunk.id
@@ -594,21 +630,15 @@ def _dedupe_chunks(chunks: list[DocumentChunk], limit: int) -> list[DocumentChun
 
 
 def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> list[LangChainDocument]:
-    base_queryset = DocumentChunk.objects.select_related("document")
-    if document_id:
-        base_queryset = base_queryset.filter(document_id=document_id)
-
-    candidates = list(base_queryset)
+    candidates = _candidate_chunks(document_id)
     if not candidates:
         chunks = []
     else:
-        selected = _forced_chunks(question, candidates)
+        selected = _vector_ranked_chunks(question, candidates, document_id, limit=24)
         for subquery in _decompose_query(question):
             ranked = _rank_chunks(subquery, candidates)
-            exact_title_matches = [chunk for chunk, score in ranked if score >= 5 and _section_title_match(subquery, chunk)]
-            selected.extend(exact_title_matches[:2] if exact_title_matches else [chunk for chunk, _score in ranked[:4]])
-        chunks = _expand_neighbours(_dedupe_chunks(selected, 20), candidates, question)
-        chunks = _dedupe_chunks(chunks, limit)
+            selected.extend([chunk for chunk, _score in ranked[:4]])
+        chunks = _dedupe_chunks(selected, limit)
 
     return [
         LangChainDocument(
@@ -617,7 +647,7 @@ def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> 
                 "chunk_id": chunk.id,
                 "chunk_index": chunk.chunk_index,
                 "document_id": chunk.document_id,
-                "document_title": chunk.document.title,
+                "document_title": chunk.document_title,
                 "chapter_title": chunk.chapter_title,
                 "section_number": chunk.section_number,
                 "section_title": chunk.section_title,
@@ -631,13 +661,22 @@ def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> 
 
 
 def _retrieve_node(state: RagState) -> RagState:
-    return {**state, "context": _retrieve(state["question"], state.get("document_id"))}
+    context = _retrieve(state["question"], state.get("document_id"))
+    logger.info("Retrieved %s chunks for question: '%s'", len(context), state["question"])
+    for i, doc in enumerate(context):
+        logger.info("Chunk %s metadata: %s", i + 1, doc.metadata)
+    return {**state, "context": context}
 
 
 def _generate_node(state: RagState) -> RagState:
+    history_text = "\n".join(f"{msg['role'].capitalize()}: {msg['content']}" for msg in state.get("history", []))
+    if history_text:
+        history_text = f"Conversation History:\n{history_text}\n\n"
+
     context = "\n\n".join(
         (
-            f"Source: {doc.metadata['document_title']} | "
+            f"[Source ID {doc.metadata['chunk_id']}] "
+            f"Document: {doc.metadata['document_title']} | "
             f"Chapter: {doc.metadata.get('chapter_title') or 'Unknown'} | "
             f"Section number: {doc.metadata.get('section_number') or 'Unknown'} | "
             f"Section: {doc.metadata.get('section_title') or 'Unknown'} | "
@@ -646,10 +685,12 @@ def _generate_node(state: RagState) -> RagState:
         )
         for doc in state["context"]
     )
+    validated = []
     if not state["context"]:
         answer = "I could not find indexed context for this document. Please re-upload the document or check that indexing completed successfully."
     elif not _ai_enabled():
         answer = "AI credentials are not configured on the backend. I retrieved relevant document context, but cannot generate an AI answer yet."
+        validated = state["context"]
     else:
         prompt = (
             "You are answering a question about a legal document. Use only the retrieved context below. "
@@ -657,27 +698,47 @@ def _generate_node(state: RagState) -> RagState:
             "Before responding, break the user's question into each distinct requested item and check each item against all retrieved passages. "
             "For list questions, make a complete answer covering each requested item; if an item is unavailable, name only that item as unavailable. "
             "Do not claim information is absent until every retrieved passage has been checked. "
-            "If multiple sections are necessary, combine them rather than answering from a single chunk. "
-            "Preserve exact legal distinctions such as may vs shall, prescribed vs explicit requirement, and may extend to vs automatic penalty. "
-            "Answer directly and cite the section name and page number for each material point. "
-            "Format the answer as concise markdown with: a level-3 heading, a first sentence beginning "
-            "'According to [section] ([page])', then bold labels such as **Short title:** and **Commencement:**, "
-            "using short bullet points where helpful. End with a **Source:** line. "
+            "If multiple retrieved sources answer different parts of the question, combine those sources in one answer. "
+            "Use every retrieved source that directly supports a distinct part of the answer, but do not cite irrelevant sources just because they were retrieved. "
+            "Preserve exact legal distinctions such as may vs shall, prescribed vs explicit requirement, and discretionary language vs automatic consequences. "
+            "Answer directly. Format the answer as concise markdown with a short level-3 heading, a direct first sentence, "
+            "bold labels where helpful, and short bullet points where helpful. "
+            "Do NOT append a Sources used block in the answer text, as it will be handled by structured output.\n\n"
             "If the answer is in the context, do not say it is missing. "
             "If the answer is not in the context, say exactly what is missing.\n\n"
+            f"{history_text}"
             f"Context:\n{context}\n\nQuestion: {state['question']}"
         )
         try:
-            answer = _chat_model().invoke(prompt).content
+            structured_model = _chat_model().with_structured_output(AnswerWithSources)
+            response = structured_model.invoke(prompt)
+            answer = response.answer
+            
+            valid_chunk_ids = {doc.metadata["chunk_id"] for doc in state["context"]}
+            validated = [
+                doc for doc in state["context"]
+                if doc.metadata["chunk_id"] in response.used_sources and doc.metadata["chunk_id"] in valid_chunk_ids
+            ]
+            
+            logger.info("Successfully generated response answer")
+            logger.info("Response used sources: %s", response.used_sources)
+            logger.info("Validated sources metadata: %s", [doc.metadata for doc in validated])
         except Exception:
-            logger.exception("Chat generation failed")
+            logger.exception(
+                "Chat generation failed provider=%s region=%s model=%s",
+                os.getenv("AI_PROVIDER", "").lower() or "openai",
+                os.getenv("AWS_REGION", ""),
+                os.getenv("AI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "")),
+            )
             top = state["context"][0]
             answer = (
-                "AI generation failed on the backend, but relevant document context was retrieved. "
-                f"The strongest source is {top.metadata.get('section_title') or 'Unknown section'} "
-                f"(page {_format_pages(top.metadata.get('page_start'), top.metadata.get('page_end'))})."
+                "I found the relevant provisions in the uploaded document, but the AI answer service is temporarily unavailable. "
+                f"Start with {top.metadata.get('section_title') or 'Unknown section'} "
+                f"(page {_format_pages(top.metadata.get('page_start'), top.metadata.get('page_end'))}); "
+                "the source extracts below are from the document."
             )
-    return {**state, "answer": answer}
+            validated = [top]
+    return {**state, "answer": answer, "validated_sources": validated}
 
 
 def _build_graph():
@@ -701,13 +762,61 @@ def _format_pages(page_start: int | None, page_end: int | None) -> str:
     return str(page_start)
 
 
-def answer_question(question: str, document_id: int | None = None) -> dict:
-    result = rag_graph.invoke({"question": question, "document_id": document_id, "context": [], "answer": ""})
+def list_document_chunks(document_id: int) -> list[dict]:
+    client = _qdrant_client()
+    if client is not None and qdrant_models is not None:
+        try:
+            points, _next_offset = client.scroll(
+                collection_name=_qdrant_collection(),
+                scroll_filter=qdrant_models.Filter(
+                    must=[
+                        qdrant_models.FieldCondition(
+                            key="document_id",
+                            match=qdrant_models.MatchValue(value=document_id),
+                        )
+                    ]
+                ),
+                with_payload=True,
+                with_vectors=False,
+                limit=500,
+            )
+            chunks = [_chunk_from_qdrant_payload(point) for point in points]
+            return [_chunk_payload(chunk) for chunk in sorted(chunks, key=lambda chunk: chunk.chunk_index)]
+        except Exception:
+            logger.exception("Qdrant chunk listing failed for document %s", document_id)
+
+    document = Document.objects.filter(id=document_id).first()
+    if not document:
+        return []
+    return [_chunk_payload(chunk) for chunk in _document_chunk_records(document)]
+
+
+def _chunk_payload(chunk: ChunkRecord) -> dict:
+    return {
+        "id": chunk.id,
+        "chunk_index": chunk.chunk_index,
+        "chapter_title": chunk.chapter_title,
+        "section_number": chunk.section_number,
+        "section_title": chunk.section_title,
+        "subsection_number": chunk.subsection_number,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "pages": _format_pages(chunk.page_start, chunk.page_end),
+        "word_count": len(chunk.content.split()),
+        "has_embedding": bool(chunk.embedding),
+        "content": chunk.content,
+    }
+
+
+def answer_question(question: str, document_id: int | None = None, history: list[dict] = None) -> dict:
+    if history is None:
+        history = []
+    result = rag_graph.invoke({"question": question, "document_id": document_id, "history": history, "context": [], "answer": "", "validated_sources": []})
     answer_lower = result["answer"].lower()
-    if any(phrase in answer_lower for phrase in ("does not contain", "not contain", "missing", "cannot answer")):
+    if any(phrase in answer_lower for phrase in ("does not contain", "not contain", "missing", "cannot answer", "could not find")):
         fallback_context = _retrieve(" ".join(_fallback_queries(question)), document_id, limit=12)
         if fallback_context:
-            result = _generate_node({"question": question, "document_id": document_id, "context": fallback_context, "answer": ""})
+            result = _generate_node({"question": question, "document_id": document_id, "history": history, "context": fallback_context, "answer": "", "validated_sources": []})
     return {
         "answer": result["answer"],
         "sources": [
@@ -722,6 +831,6 @@ def answer_question(question: str, document_id: int | None = None) -> dict:
                 "pages": _format_pages(doc.metadata.get("page_start"), doc.metadata.get("page_end")),
                 "preview": doc.page_content[:600],
             }
-            for doc in result["context"]
+            for doc in result.get("validated_sources", [])
         ],
     }
