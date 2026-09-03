@@ -53,12 +53,17 @@ class HealthView(APIView):
         )
 
 
+from django.db.models import Count, Q
+
+
 class DocumentListCreateView(generics.ListCreateAPIView):
     serializer_class = DocumentSerializer
     parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def get_queryset(self):
-        return Document.objects.order_by("-created_at")
+        return Document.objects.annotate(
+            message_count_annotated=Count("messages", filter=Q(messages__role="user"))
+        ).order_by("-created_at")
 
     def perform_create(self, serializer):
         upload = serializer.validated_data.pop("file", None)
@@ -125,3 +130,12 @@ class ChatHistoryView(generics.ListAPIView):
 
     def get_queryset(self):
         return ChatMessage.objects.filter(document_id=self.kwargs["document_id"]).order_by("created_at")
+
+class DocumentRetrieveDestroyView(generics.RetrieveDestroyAPIView):
+    serializer_class = DocumentSerializer
+
+    def get_queryset(self):
+        return Document.objects.all()
+
+    def perform_destroy(self, instance):
+        instance.delete()

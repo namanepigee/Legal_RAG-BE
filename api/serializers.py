@@ -6,7 +6,12 @@ from .models import ChatMessage, Document
 class DocumentSerializer(serializers.ModelSerializer):
     file = serializers.FileField(write_only=True, required=False)
     chunk_count = serializers.IntegerField(read_only=True)
-    message_count = serializers.IntegerField(read_only=True)
+    message_count = serializers.SerializerMethodField()
+
+    def get_message_count(self, obj):
+        if hasattr(obj, "message_count_annotated"):
+            return obj.message_count_annotated
+        return obj.messages.filter(role="user").count()
 
     class Meta:
         model = Document

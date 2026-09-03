@@ -7,6 +7,10 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import TypedDict
 
+
+
+
+
 from langchain_core.documents import Document as LangChainDocument
 from langchain_aws import BedrockEmbeddings, ChatBedrockConverse
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -21,7 +25,27 @@ except ImportError:
     QdrantClient = None
     qdrant_models = None
 
+import sys
+
 logger = logging.getLogger(__name__)
+
+backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+log_file_path = os.path.join(backend_dir, "logs.log")
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+
+if not logger.handlers:
+    # File Handler to logs.log
+    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # Stream Handler to Terminal / stdout
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    logger.setLevel(logging.INFO)
 
 MAX_CHUNK_WORDS = 450
 CHUNK_OVERLAP_WORDS = 70
@@ -95,34 +119,50 @@ def _embeddings():
 
 
 def _chat_model():
-    if os.getenv("AI_PROVIDER", "").lower() == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(model=os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-pro"), temperature=0)
-    if os.getenv("AI_PROVIDER", "").lower() == "bedrock":
+    provider = os.getenv("AI_PROVIDER", "").lower()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+
+    if provider == "openrouter" and openrouter_key:
+        return ChatOpenAI(
+            model=os.getenv("AI_MODEL", "minimax/minimax-m3:free"), 
+            temperature=0, 
+            openai_api_key=openrouter_key, 
+            openai_api_base="https://openrouter.ai/api/v1"
+        )
+    if (provider == "bedrock" or (provider == "openrouter" and not openrouter_key)) and aws_key:
+        bedrock_model = os.getenv("AI_MODEL", "")
+        if "/" in bedrock_model or ":" in bedrock_model or not bedrock_model:
+            bedrock_model = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
         return ChatBedrockConverse(
-            model=os.getenv("AI_MODEL", "anthropic.claude-3-5-haiku-20241022-v1:0"),
+            model=bedrock_model,
             region_name=os.getenv("AWS_REGION", "us-east-1"),
             temperature=0,
         )
-    if os.getenv("AI_PROVIDER", "").lower() == "openrouter":
-        return ChatOpenAI(
-            model=os.getenv("AI_MODEL", "google/gemini-2.0-pro-exp-02-05:free"), 
-            temperature=0, 
-            openai_api_key=os.getenv("OPENROUTER_API_KEY"), 
-            openai_api_base="https://openrouter.ai/api/v1"
-        )
+    if provider == "gemini" and os.getenv("GEMINI_API_KEY"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(model=os.getenv("GEMINI_CHAT_MODEL", "gemini-1.5-pro"), temperature=0)
+
     return ChatOpenAI(model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"), temperature=0)
 
 
 def _ai_enabled() -> bool:
     provider = os.getenv("AI_PROVIDER", "").lower()
-    if provider == "gemini":
-        return bool(os.getenv("GEMINI_API_KEY"))
-    if provider == "bedrock":
-        return bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
-    if provider == "openrouter":
-        return bool(os.getenv("OPENROUTER_API_KEY"))
-    return bool(os.getenv("OPENAI_API_KEY"))
+    if provider == "gemini" and os.getenv("GEMINI_API_KEY"):
+        return True
+    if provider == "bedrock" and os.getenv("AWS_ACCESS_KEY_ID"):
+        return True
+    if provider == "openrouter" and os.getenv("OPENROUTER_API_KEY"):
+        return True
+    if provider == "openai" and os.getenv("OPENAI_API_KEY"):
+        return True
+    # Fallback: check if ANY key is configured
+    return bool(
+        os.getenv("OPENROUTER_API_KEY") or 
+        os.getenv("AWS_ACCESS_KEY_ID") or 
+        os.getenv("OPENAI_API_KEY") or 
+        os.getenv("GEMINI_API_KEY")
+    )
 
 
 def _embeddings_enabled() -> bool:
@@ -244,13 +284,17 @@ def _upsert_qdrant_vectors(chunks: list[ChunkRecord], vectors: list[list[float]]
 
 
 import tempfile
-from docling.document_converter import DocumentConverter
 
 def extract_uploaded_file(upload) -> dict:
     name = upload.name.lower()
+    logger.info("\n==================================================")
+    logger.info("[EXTRACTION STARTED] File: %s", name)
+    logger.info("==================================================")
     
     if not (name.endswith(".pdf") or name.endswith(".docx")):
         text = upload.read().decode("utf-8", errors="ignore")
+        logger.info("[TEXT FILE EXTRACTED] %s - Length: %s chars", name, len(text))
+        logger.info("Sample Preview: %s", text[:300])
         return {"content": text, "page_count": 0, "pages": [{"page": None, "text": text}]}
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{name.split('.')[-1]}") as tmp:
@@ -259,37 +303,110 @@ def extract_uploaded_file(upload) -> dict:
         tmp_path = tmp.name
 
     try:
-        converter = DocumentConverter()
-        doc = converter.convert(tmp_path).document
-
-        page_dict = {}
-        for item, level in doc.iterate_items():
-            if hasattr(item, "text") and item.text:
-                page_no = None
-                if hasattr(item, "prov") and item.prov:
-                    page_no = item.prov[0].page_no
-
-                if page_no not in page_dict:
-                    page_dict[page_no] = []
-                page_dict[page_no].append(item.text)
-
         pages = []
-        for page_no, texts in sorted(page_dict.items(), key=lambda x: x[0] if x[0] is not None else 0):
-            pages.append({"page": page_no, "text": "\n".join(texts)})
+        # 1. Try Docling with cross-platform OCR options (OcrMacOptions on macOS, EasyOcrOptions/Default on Linux)
+        try:
+            import platform
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.base_models import InputFormat
 
-        if not pages:
-            text = doc.export_to_markdown()
-            pages = [{"page": None, "text": text}]
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = True
+
+            if platform.system() == "Darwin":
+                try:
+                    from docling.datamodel.pipeline_options import OcrMacOptions
+                    pipeline_options.ocr_options = OcrMacOptions()
+                    logger.info("Docling initialized with Apple Vision Native OCR (OcrMacOptions)...")
+                except Exception as mac_err:
+                    pipeline_options.do_ocr = False
+                    logger.info("Apple Vision OCR unavailable (%s), running standard text extraction...", mac_err)
+            else:
+                try:
+                    from docling.datamodel.pipeline_options import EasyOcrOptions
+                    pipeline_options.ocr_options = EasyOcrOptions()
+                    logger.info("Docling initialized with EasyOCR for Linux deployment...")
+                except Exception as linux_err:
+                    logger.info("Defaulting to standard Docling OCR options (%s)...", linux_err)
+
+            converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+            )
+            result = converter.convert(tmp_path)
+
+            doc = getattr(result, "document", None)
+            page_dict = {}
+
+            if doc and hasattr(doc, "iterate_items"):
+                for item, level in doc.iterate_items():
+                    if hasattr(item, "text") and item.text:
+                        page_no = 1
+                        if hasattr(item, "prov") and item.prov:
+                            try:
+                                page_no = item.prov[0].page_no
+                            except (IndexError, AttributeError):
+                                page_no = 1
+                        page_dict.setdefault(page_no, []).append(item.text)
+
+            if page_dict:
+                for p_num in sorted(page_dict.keys()):
+                    pages.append({"page": p_num, "text": "\n".join(page_dict[p_num])})
+
+            if not pages and doc and hasattr(doc, "pages") and doc.pages:
+                for page_no, page in doc.pages.items():
+                    page_text = page.export_to_markdown() if hasattr(page, "export_to_markdown") else getattr(page, "text", "")
+                    if page_text.strip():
+                        pages.append({"page": page_no, "text": page_text})
+
+            if not pages and doc:
+                raw_md = result.document.export_to_markdown() if hasattr(result, "document") else ""
+                paragraphs = raw_md.split("\n\n")
+                current_page_num = 1
+                current_words = 0
+                page_text_acc = []
+                for p in paragraphs:
+                    w_cnt = len(p.split())
+                    if current_words + w_cnt > 450 and page_text_acc:
+                        pages.append({"page": current_page_num, "text": "\n\n".join(page_text_acc)})
+                        current_page_num += 1
+                        page_text_acc = [p]
+                        current_words = w_cnt
+                    else:
+                        page_text_acc.append(p)
+                        current_words += w_cnt
+                if page_text_acc:
+                    pages.append({"page": current_page_num, "text": "\n\n".join(page_text_acc)})
+        except Exception as docling_err:
+            logger.warning("Docling extraction encountered issue, attempting fallback: %s", docling_err)
+
+        # 2. Fallback to pypdf if Docling returned no pages or failed
+        if not pages and name.endswith(".pdf"):
+            logger.info("Extracting PDF text via pypdf fallback...")
+            import pypdf
+            reader = pypdf.PdfReader(tmp_path)
+            for idx, page in enumerate(reader.pages, start=1):
+                extracted = page.extract_text() or ""
+                if extracted.strip():
+                    pages.append({"page": idx, "text": extracted})
 
         content = "\n\n".join(f"--- PAGE {p['page']} ---\n{p['text']}" if p["page"] else p["text"] for p in pages)
-        page_count = len([p for p in pages if p["page"] is not None])
+        page_count = len(pages)
+        
+        logger.info("\n==================================================")
+        logger.info("[EXTRACTION COMPLETE] File: %s", name)
+        logger.info("Pages generated: %s | Total Content Length: %s chars", page_count, len(content))
+        logger.info("Extracted Text Preview (First 500 chars):\n%s", content[:500])
+        logger.info("==================================================")
+        
         return {
             "content": content,
             "page_count": page_count,
             "pages": pages,
         }
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def _word_windows(text: str, max_words: int = MAX_CHUNK_WORDS) -> list[str]:
@@ -372,18 +489,43 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def _extract_section_title(text: str) -> str:
+    for line in text.splitlines():
+        clean = line.strip().lstrip("#").strip()
+        if not clean or len(clean) < 3:
+            continue
+        if re.match(r"^(CHAPTER\s+[IVXLCDM0-9]+|SECTION\s+\d+|\d+\.\s+[A-Z]|#)", line.strip(), re.IGNORECASE):
+            return clean[:90]
+    return ""
+
+
 def _page_chunks(page_texts: list[dict]) -> list[dict]:
     chunks = []
+    current_chapter = ""
+    current_section = ""
+
     for page_item in page_texts:
         page_number = page_item.get("page")
         text = re.sub(r"[ \t]+", " ", page_item.get("text", "")).strip()
+        if not text:
+            continue
+
         for chunk_text in _word_windows(text):
+            detected = _extract_section_title(chunk_text)
+            if detected:
+                if "CHAPTER" in detected.upper():
+                    current_chapter = detected
+                else:
+                    current_section = detected
+
+            section_display = current_section or current_chapter or (f"Page {page_number}" if page_number else "")
+
             chunks.append(
                 {
                     "content": chunk_text,
-                    "chapter_title": "",
+                    "chapter_title": current_chapter,
                     "section_number": "",
-                    "section_title": "",
+                    "section_title": section_display,
                     "subsection_number": "",
                     "page_start": page_number,
                     "page_end": page_number,
@@ -440,6 +582,9 @@ def _legacy_page_texts_from_document_content(content: str, page_count: int) -> l
 
 
 def index_document(document: Document) -> None:
+    logger.info("\n==================================================")
+    logger.info("[INDEXING STARTED] Document ID: %s | Title: '%s' | Content Length: %s chars", document.id, document.title, len(document.content))
+    logger.info("==================================================")
     _delete_qdrant_document_vectors(document.id)
     page_texts = getattr(
         document,
@@ -447,6 +592,10 @@ def index_document(document: Document) -> None:
         _legacy_page_texts_from_document_content(document.content, document.page_count),
     )
     chunks = _page_chunks(page_texts)
+    logger.info("[CHUNKS CREATED] Total chunks generated: %s", len(chunks))
+    for i, c in enumerate(chunks):
+        logger.info("  Chunk #%s | Pages: %s-%s | Section: '%s' | Length: %s chars | Preview: '%s'",
+                    i, c.get("page_start"), c.get("page_end"), c.get("section_title") or "N/A", len(c["content"]), c["content"][:120].replace('\n', ' '))
 
     vectors = []
     if _embeddings_enabled() and chunks:
@@ -477,6 +626,7 @@ def index_document(document: Document) -> None:
         for index, chunk in enumerate(chunks)
     ]
     _upsert_qdrant_vectors(created_chunks, vectors)
+    logger.info("[INDEXING COMPLETE] Successfully indexed document %s", document.id)
 
 
 def _decompose_query(question: str) -> list[str]:
@@ -629,9 +779,11 @@ def _dedupe_chunks(chunks: list[ChunkRecord], limit: int) -> list[ChunkRecord]:
     return list(deduped.values())[:limit]
 
 
-def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> list[LangChainDocument]:
+def _retrieve(question: str, document_id: int | None = None, limit: int = 3) -> list[LangChainDocument]:
+    logger.info("[RETRIEVAL STARTED] Query: '%s' | Doc Filter: %s", question, document_id)
     candidates = _candidate_chunks(document_id)
     if not candidates:
+        logger.info("[RETRIEVAL] No candidate chunks found.")
         chunks = []
     else:
         selected = _vector_ranked_chunks(question, candidates, document_id, limit=24)
@@ -639,6 +791,7 @@ def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> 
             ranked = _rank_chunks(subquery, candidates)
             selected.extend([chunk for chunk, _score in ranked[:4]])
         chunks = _dedupe_chunks(selected, limit)
+        logger.info("[RETRIEVAL] Found %s candidate chunks after re-ranking.", len(chunks))
 
     return [
         LangChainDocument(
@@ -661,10 +814,17 @@ def _retrieve(question: str, document_id: int | None = None, limit: int = 8) -> 
 
 
 def _retrieve_node(state: RagState) -> RagState:
+    logger.info("\n==================================================")
+    logger.info("[QUESTION RECEIVED] Question: '%s' | Document ID Filter: %s", state["question"], state.get("document_id"))
+    logger.info("==================================================")
     context = _retrieve(state["question"], state.get("document_id"))
-    logger.info("Retrieved %s chunks for question: '%s'", len(context), state["question"])
+    logger.info("[VECTOR MATCHES RETURNED] Total Matched Chunks: %s", len(context))
     for i, doc in enumerate(context):
-        logger.info("Chunk %s metadata: %s", i + 1, doc.metadata)
+        logger.info("  Matched Chunk #%s -> Chunk ID: %s | Section: '%s' | Pages: %s-%s | Content Preview:\n    '%s'",
+                    i + 1, doc.metadata["chunk_id"], doc.metadata.get("section_title") or "N/A",
+                    doc.metadata.get("page_start"), doc.metadata.get("page_end"),
+                    doc.page_content[:200].replace('\n', ' '))
+    logger.info("==================================================")
     return {**state, "context": context}
 
 
@@ -710,34 +870,58 @@ def _generate_node(state: RagState) -> RagState:
             f"Context:\n{context}\n\nQuestion: {state['question']}"
         )
         try:
-            structured_model = _chat_model().with_structured_output(AnswerWithSources)
-            response = structured_model.invoke(prompt)
-            answer = response.answer
-            
-            valid_chunk_ids = {doc.metadata["chunk_id"] for doc in state["context"]}
-            validated = [
-                doc for doc in state["context"]
-                if doc.metadata["chunk_id"] in response.used_sources and doc.metadata["chunk_id"] in valid_chunk_ids
-            ]
-            
-            logger.info("Successfully generated response answer")
-            logger.info("Response used sources: %s", response.used_sources)
-            logger.info("Validated sources metadata: %s", [doc.metadata for doc in validated])
-        except Exception:
-            logger.exception(
-                "Chat generation failed provider=%s region=%s model=%s",
-                os.getenv("AI_PROVIDER", "").lower() or "openai",
-                os.getenv("AWS_REGION", ""),
-                os.getenv("AI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "")),
-            )
-            top = state["context"][0]
+            logger.info("\n==================================================")
+            logger.info("[SENDING PROMPT TO AI] Provider: %s | Model: %s", os.getenv("AI_PROVIDER", "openai"), os.getenv("AI_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")))
+            logger.info("Context Passages Count: %s | Prompt Length: %s chars", len(state["context"]), len(prompt))
+            logger.info("Prompt Preview (First 400 chars):\n%s", prompt[:400])
+            logger.info("==================================================")
+
+            provider = os.getenv("AI_PROVIDER", "").lower()
+            answer = ""
+            validated = []
+
+            # For OpenRouter or models without native JSON schema tool calling, use standard completion directly
+            if provider == "openrouter":
+                res = _chat_model().invoke(prompt)
+                answer = res.content if hasattr(res, "content") else str(res)
+                validated = state["context"][:3]
+                logger.info("[OPENROUTER AI RESPONSE SUCCESSFUL]")
+            else:
+                try:
+                    structured_model = _chat_model().with_structured_output(AnswerWithSources)
+                    response = structured_model.invoke(prompt)
+                    if response and hasattr(response, "answer") and response.answer:
+                        answer = response.answer
+                        valid_chunk_ids = {doc.metadata["chunk_id"] for doc in state["context"]}
+                        validated = [
+                            doc for doc in state["context"]
+                            if doc.metadata["chunk_id"] in getattr(response, "used_sources", []) and doc.metadata["chunk_id"] in valid_chunk_ids
+                        ]
+                    if not answer:
+                        res = _chat_model().invoke(prompt)
+                        answer = res.content if hasattr(res, "content") else str(res)
+                    if not validated:
+                        validated = state["context"][:3]
+                    logger.info("[STRUCTURED AI RESPONSE SUCCESSFUL]")
+                except Exception:
+                    res = _chat_model().invoke(prompt)
+                    answer = res.content if hasattr(res, "content") else str(res)
+                    validated = state["context"][:3]
+                    logger.info("[PLAIN TEXT AI RESPONSE SUCCESSFUL]")
+
+            logger.info("\n==================================================")
+            logger.info("[AI ANSWER GENERATED]")
+            logger.info("Answer Text:\n%s", answer)
+            logger.info("Validated Sources Returned: %s chunks", len(validated))
+            logger.info("==================================================")
+        except Exception as e_gen:
+            logger.exception("AI generation failed completely for provider=%s", os.getenv("AI_PROVIDER", ""))
+            top = state["context"][0] if state["context"] else None
             answer = (
-                "I found the relevant provisions in the uploaded document, but the AI answer service is temporarily unavailable. "
-                f"Start with {top.metadata.get('section_title') or 'Unknown section'} "
-                f"(page {_format_pages(top.metadata.get('page_start'), top.metadata.get('page_end'))}); "
-                "the source extracts below are from the document."
+                "I found relevant provisions in the document, but the AI language model service encountered an error. "
+                + (f"Please review section '{top.metadata.get('section_title') or 'Provisions'}' on page {_format_pages(top.metadata.get('page_start'), top.metadata.get('page_end'))}." if top else "")
             )
-            validated = [top]
+            validated = [top] if top else []
     return {**state, "answer": answer, "validated_sources": validated}
 
 
@@ -809,14 +993,21 @@ def _chunk_payload(chunk: ChunkRecord) -> dict:
 
 
 def answer_question(question: str, document_id: int | None = None, history: list[dict] = None) -> dict:
+    logger.info("=== Answering Question ===")
+    logger.info("Question: '%s', Document ID: %s", question, document_id)
     if history is None:
         history = []
     result = rag_graph.invoke({"question": question, "document_id": document_id, "history": history, "context": [], "answer": "", "validated_sources": []})
+    
+    logger.info("Initial RAG answer generated. Checking for missing context fallbacks...")
     answer_lower = result["answer"].lower()
     if any(phrase in answer_lower for phrase in ("does not contain", "not contain", "missing", "cannot answer", "could not find")):
+        logger.info("Answer contained fallback phrase. Attempting broad retrieval...")
         fallback_context = _retrieve(" ".join(_fallback_queries(question)), document_id, limit=12)
         if fallback_context:
+            logger.info("Broad retrieval succeeded. Re-generating answer...")
             result = _generate_node({"question": question, "document_id": document_id, "history": history, "context": fallback_context, "answer": "", "validated_sources": []})
+    logger.info("=== Completed Answering Question ===")
     return {
         "answer": result["answer"],
         "sources": [

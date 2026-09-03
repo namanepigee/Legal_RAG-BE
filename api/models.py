@@ -8,6 +8,10 @@ class Document(models.Model):
     page_count = models.PositiveIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    @property
+    def message_count(self):
+        return self.messages.filter(role="user").count()
+
     def __str__(self):
         return self.title
 
